@@ -9,6 +9,9 @@ let torrent = null; // 当前种子实例
 let connectedPeers = {}; // 存储已连接的对等点
 let myPeerId = null; // 我的唯一ID
 let roomId = 'default-room'; // 默认房间ID
+let reconnectAttempts = 0; // 连接尝试次数
+let isInitializing = false; // 是否正在初始化WebTorrent
+let webtorrentInitialized = false; // WebTorrent是否已初始化
 
 // DOM元素
 const addGroupBtn = document.getElementById('add-group');
@@ -23,11 +26,67 @@ const addUngroupedBtn = document.getElementById('add-ungrouped');
 // WebTorrent连接相关元素
 const connectionStatus = document.getElementById('connection-status');
 const roomIdInput = document.getElementById('room-id');
-const joinRoomBtn = document.getElementById('join-room');
 const peerList = document.getElementById('peer-list');
 
-// 初始化函数
+// 初始化应用函数
+function initApp() {
+    console.log('初始化应用');
+    
+    // 如果已经在执行初始化，则退出
+    if (isInitializing) return;
+    isInitializing = true;
+    
+    try {
+        // 从localStorage加载数据
+        loadData();
+        
+        // 渲染表格和未分组成员
+        renderTable();
+        renderUngroupedMembers();
+        
+        // 生成唯一的对等点ID
+        myPeerId = generatePeerId();
+        
+        // 初始化WebTorrent
+        // 检查WebTorrent是否存在
+        if (typeof WebTorrent === 'undefined') {
+            console.error('WebTorrent未定义，尝试等待加载');
+            connectionStatus.textContent = '正在加载网络组件...';
+            
+            // 等待WebTorrent加载
+            const waitForWebTorrent = setInterval(() => {
+                if (typeof WebTorrent !== 'undefined') {
+                    clearInterval(waitForWebTorrent);
+                    console.log('WebTorrent已加载，继续初始化');
+                    initWebTorrent();
+                }
+            }, 500);
+            
+            // 10秒后如果还没加载成功，显示错误
+            setTimeout(() => {
+                if (!webtorrentInitialized) {
+                    clearInterval(waitForWebTorrent);
+                    console.error('WebTorrent库加载超时');
+                    connectionStatus.textContent = 'WebTorrent加载失败，只能使用本地模式';
+                    connectionStatus.style.backgroundColor = '#f8d7da';
+                    isInitializing = false;
+                }
+            }, 10000);
+        } else {
+            // WebTorrent已存在，直接初始化
+            initWebTorrent();
+        }
+    } catch (err) {
+        console.error('应用初始化失败:', err);
+        connectionStatus.textContent = '应用初始化失败: ' + err.message;
+        isInitializing = false;
+    }
+}
+
+// 初始化函数 - 主要设置事件监听
 function init() {
+    console.log('设置事件监听');
+    
     // 添加事件监听
     addGroupBtn.addEventListener('click', addNewGroup);
     document.getElementById('save-local').addEventListener('click', saveData);
@@ -42,116 +101,181 @@ function init() {
         }
     });
     
-    // WebTorrent连接事件
-    joinRoomBtn.addEventListener('click', joinRoom);
-    
-    // 从localStorage加载数据
-    loadData();
-    
-    // 渲染表格和未分组成员
-    renderTable();
-    renderUngroupedMembers();
-    
-    // 初始化WebTorrent
-    initWebTorrent();
-    
-    // 生成唯一的对等点ID
-    myPeerId = generatePeerId();
+    // 延迟初始化应用，确保DOM完全加载
+    setTimeout(initApp, 500);
 }
 
 // 生成唯一的对等点ID
 function generatePeerId() {
-    return 'peer-' + Math.random().toString(36).substr(2, 9);
+    return 'peer-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
 }
 
 // 初始化WebTorrent
 function initWebTorrent() {
     try {
+        console.log('正在初始化WebTorrent');
+        connectionStatus.textContent = '正在初始化网络连接...';
+        
+        // 确保Buffer在全局可用
+        if (!window.Buffer) {
+            window.Buffer = (typeof Buffer !== 'undefined') ? Buffer : null;
+            if (!window.Buffer && typeof require === 'function') {
+                try {
+                    window.Buffer = require('buffer').Buffer;
+                } catch (e) {
+                    console.error('无法加载Buffer:', e);
+                }
+            }
+            
+            if (!window.Buffer) {
+                if (typeof Buffer !== 'undefined') {
+                    window.Buffer = Buffer;
+                } else if (typeof window.buffer !== 'undefined' && window.buffer.Buffer) {
+                    window.Buffer = window.buffer.Buffer;
+                }
+            }
+        }
+        
+        // 确认Buffer可用性
+        if (!window.Buffer) {
+            throw new Error('无法加载Buffer库，这是WebTorrent的必要依赖');
+        }
+        
+        // 销毁任何现有的客户端实例
+        if (client) {
+            try {
+                client.destroy();
+                console.log('已销毁旧的WebTorrent客户端');
+            } catch (e) {
+                console.error('销毁旧客户端失败:', e);
+            }
+        }
+        
         // 创建WebTorrent客户端
-        client = new WebTorrent();
-        connectionStatus.textContent = '准备就绪，请输入房间ID并加入';
+        console.log('创建WebTorrent客户端');
+        client = new WebTorrent({
+            tracker: {
+                announce: [
+                    'wss://tracker.btorrent.xyz',
+                    'wss://tracker.openwebtorrent.com',
+                    'wss://tracker.webtorrent.io'
+                ]
+            }
+        });
+        
+        if (!client) {
+            throw new Error('WebTorrent客户端创建失败');
+        }
+        
+        console.log('WebTorrent客户端创建成功');
+        connectionStatus.textContent = '正在连接到房间...';
         
         // 设置WebTorrent事件监听
         client.on('error', (err) => {
             console.error('WebTorrent错误:', err);
+            
+            // 忽略特定错误
+            if (err.message && (
+                err.message.includes('duplicate torrent') || 
+                err.message.includes('Cannot add duplicate')
+            )) {
+                console.log('忽略重复种子错误');
+                return;
+            }
+            
             connectionStatus.textContent = '连接错误: ' + err.message;
             connectionStatus.classList.remove('connected');
+            
+            // 尝试重新连接
+            if (reconnectAttempts < 3) {
+                reconnectAttempts++;
+                console.log(`连接出错，第${reconnectAttempts}次重试...`);
+                setTimeout(() => {
+                    joinRoom();
+                }, 2000);
+            }
         });
         
-        // 使用之前保存的房间ID(如果有)
-        const savedRoomId = localStorage.getItem('roomId');
-        if (savedRoomId) {
-            roomIdInput.value = savedRoomId;
-        }
+        // 添加种子事件
+        client.on('torrent', (t) => {
+            console.log('发现种子:', t.infoHash);
+            if (t !== torrent) {
+                setupTorrentEvents(t);
+            }
+        });
+        
+        // 成功创建客户端后自动加入房间
+        webtorrentInitialized = true;
+        isInitializing = false;
+        
+        console.log('WebTorrent初始化完成，准备加入房间');
+        setTimeout(() => {
+            joinRoom();
+        }, 1000);
         
     } catch (err) {
         console.error('初始化WebTorrent失败:', err);
-        connectionStatus.textContent = 'WebTorrent初始化失败';
+        connectionStatus.textContent = 'WebTorrent初始化失败: ' + err.message;
+        connectionStatus.style.backgroundColor = '#f8d7da';
+        isInitializing = false;
+        
+        // 标记为本地模式
+        webtorrentInitialized = false;
+        
+        // 即使WebTorrent失败，也允许用户使用本地功能
+        renderTable();
+        renderUngroupedMembers();
     }
 }
 
 // 加入房间
 function joinRoom() {
     if (!client) {
-        alert('WebTorrent客户端未初始化，请刷新页面重试');
+        connectionStatus.textContent = 'WebTorrent客户端未初始化，请刷新页面重试';
         return;
     }
     
-    // 获取房间ID
-    roomId = roomIdInput.value.trim();
-    if (!roomId) {
-        alert('请输入有效的房间ID');
-        return;
-    }
-    
-    // 保存房间ID到本地存储
-    localStorage.setItem('roomId', roomId);
+    // 使用默认房间ID
+    roomId = 'default-room';
     
     connectionStatus.textContent = '正在连接到房间...';
     
-    // 创建种子的磁力链接/信息哈希
-    // 我们使用房间ID作为种子的唯一标识符
-    const magnetURI = `magnet:?xt=urn:btih:${roomId}`;
-    
-    // 检查是否已经有对应的种子
-    if (torrent) {
-        // 如果已有种子，先移除
-        client.remove(torrent);
-        connectedPeers = {};
-        updatePeerList();
-    }
-    
     try {
-        // 使用WebTorrent加入/创建对应的种子
-        client.seed(new Blob([JSON.stringify({
-            id: myPeerId,
-            time: Date.now()
-        })]), { 
-            name: roomId,
+        // 清理现有的种子
+        cleanupExistingTorrents();
+        
+        // 创建唯一的种子名称
+        const uniqueSeedId = `room-${roomId}-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+        
+        // 创建种子数据
+        const seedData = new Blob([JSON.stringify({
+            roomId: roomId,
+            peerId: myPeerId,
+            uniqueId: uniqueSeedId,
+            timestamp: Date.now()
+        })]);
+        
+        // 使用WebTorrent创建新种子
+        client.seed(seedData, {
+            name: uniqueSeedId,
             announce: [
-                'wss://tracker.openwebtorrent.com',
-                'wss://tracker.btorrent.xyz'
+                'wss://tracker.btorrent.xyz',
+                'wss://tracker.openwebtorrent.com'
             ]
         }, (seed) => {
             torrent = seed;
-            console.log('创建种子成功:', torrent.magnetURI);
+            console.log('创建房间成功，种子哈希:', torrent.infoHash);
             
             // 设置种子事件监听
             setupTorrentEvents(torrent);
             
-            // 同时也加入这个种子以接收其他对等点的数据
-            client.add(magnetURI, { announce: [
-                'wss://tracker.openwebtorrent.com',
-                'wss://tracker.btorrent.xyz'
-            ]}, (download) => {
-                // 如果是新的种子，设置事件监听
-                if (download !== torrent) {
-                    setupTorrentEvents(download);
-                }
-            });
-            
+            // 更新状态
             connectionStatus.textContent = '已连接到房间';
             connectionStatus.classList.add('connected');
+            reconnectAttempts = 0;
+            
+            // 广播自己的存在
+            broadcastPresence();
         });
     } catch (err) {
         console.error('加入房间失败:', err);
@@ -159,10 +283,56 @@ function joinRoom() {
     }
 }
 
+// 清理现有的种子
+function cleanupExistingTorrents() {
+    if (client && client.torrents.length > 0) {
+        console.log(`清理 ${client.torrents.length} 个现有种子`);
+        
+        const torrentsToRemove = [...client.torrents]; // 创建副本以避免修改迭代中的数组
+        torrentsToRemove.forEach(t => {
+            try {
+                client.remove(t.infoHash);
+                console.log(`成功移除种子: ${t.infoHash}`);
+            } catch (err) {
+                console.warn(`移除种子失败: ${t.infoHash}`, err);
+            }
+        });
+        
+        // 重置对等点
+        connectedPeers = {};
+        updatePeerList();
+    }
+}
+
+// 广播自己的存在
+function broadcastPresence() {
+    // 每隔一段时间广播一次自己的存在，帮助其他用户发现
+    setInterval(() => {
+        if (Object.keys(connectedPeers).length === 0) {
+            console.log('未检测到其他用户，广播自己的存在');
+            // 这只是为了触发一些网络活动，帮助对等点发现
+            torrent.wires.forEach(wire => {
+                if (wire.sendMessage) {
+                    wire.sendMessage({
+                        type: 'ping',
+                        from: myPeerId,
+                        timestamp: Date.now()
+                    });
+                }
+            });
+        }
+    }, 10000); // 每10秒尝试一次
+}
+
 // 设置种子事件监听
 function setupTorrentEvents(t) {
     // 对等点连接事件
     t.on('wire', (wire) => {
+        // 确保wire有唯一ID
+        if (!wire.peerId) {
+            wire.peerId = 'peer-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+        }
+        
         console.log('新的对等点连接:', wire.peerId);
         
         // 设置数据通道
@@ -200,6 +370,11 @@ function setupTorrentEvents(t) {
     t.on('error', (err) => {
         console.error('种子错误:', err);
     });
+    
+    // 种子就绪事件
+    t.on('ready', () => {
+        console.log('种子就绪:', t.infoHash);
+    });
 }
 
 // 设置消息通道
@@ -207,6 +382,17 @@ function setupMessageChannel(wire) {
     return function(wire) {
         // 实现自定义消息协议
         wire.extendedHandshake.messageChannel = true;
+        
+        // 创建一个安全的send方法
+        wire.sendMessage = (data) => {
+            try {
+                const jsonStr = JSON.stringify(data);
+                const buf = Buffer.from(jsonStr);
+                wire.extended('message', buf);
+            } catch (err) {
+                console.error('消息发送失败:', err);
+            }
+        };
         
         // 接收到扩展握手
         wire.on('extended', (ext, buf) => {
@@ -219,12 +405,6 @@ function setupMessageChannel(wire) {
                 }
             }
         });
-        
-        // 添加发送消息的方法
-        wire.sendMessage = (data) => {
-            const buf = Buffer.from(JSON.stringify(data));
-            wire.extended('message', buf);
-        };
     };
 }
 

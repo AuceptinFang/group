@@ -5,8 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>分组管理表格</title>
     <link rel="stylesheet" href="styles.css">
-    <script src="https://cdn.jsdelivr.net/npm/webtorrent@latest/webtorrent.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.0/simplepeer.min.js"></script>
+    <!-- 加载Buffer库 -->
+    <script src="https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.js"></script>
+    <!-- 直接从官方CDN加载WebTorrent -->
+    <script src="https://cdn.jsdelivr.net/npm/webtorrent@1.8.1/webtorrent.min.js"></script>
+    <!-- 兼容性修复 -->
+    <script>
+        // 确保WebTorrent正确加载
+        window.addEventListener('DOMContentLoaded', function() {
+            if (typeof WebTorrent === 'undefined') {
+                console.error('WebTorrent库加载失败，尝试备用加载');
+                var script = document.createElement('script');
+                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/webtorrent/1.8.1/webtorrent.min.js';
+                script.onload = function() {
+                    console.log('WebTorrent库备用加载成功');
+                    if (typeof initApp === 'function') initApp();
+                };
+                script.onerror = function() {
+                    console.error('WebTorrent备用库也加载失败');
+                    alert('网络连接组件加载失败，请刷新页面或检查网络连接');
+                };
+                document.head.appendChild(script);
+            } else {
+                console.log('WebTorrent库加载成功');
+            }
+        });
+    </script>
 </head>
 <body>
     <div class="container">
@@ -15,11 +39,9 @@
             <!-- P2P连接状态显示 -->
             <div class="connection-info">
                 <div id="connection-status">正在连接网络...</div>
-                <div id="room-info">
-                    <input type="text" id="room-id" placeholder="输入房间ID（多用户需要相同ID）" value="default-room">
-                    <button id="join-room" class="primary-btn">加入房间</button>
+                <div id="room-info" style="display:none;">
+                    <input type="text" id="room-id" value="default-room">
                 </div>
-                
             </div>
         </header>
 
