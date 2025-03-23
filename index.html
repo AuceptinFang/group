@@ -5,31 +5,80 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>分组管理表格</title>
     <link rel="stylesheet" href="styles.css">
-    <!-- 加载Buffer库 -->
-    <script src="https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.js"></script>
-    <!-- 直接从官方CDN加载WebTorrent -->
-    <script src="https://cdn.jsdelivr.net/npm/webtorrent@1.8.1/webtorrent.min.js"></script>
-    <!-- 兼容性修复 -->
+    
+    <!-- WebTorrent直接集成 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/webtorrent/1.8.0/webtorrent.min.js"></script>
     <script>
-        // 确保WebTorrent正确加载
+        // WebTorrent初始化状态跟踪
+        window.appState = {
+            webtorrentLoaded: false,
+            bufferLoaded: false
+        };
+        
+        // 检查WebTorrent是否成功加载
         window.addEventListener('DOMContentLoaded', function() {
-            if (typeof WebTorrent === 'undefined') {
-                console.error('WebTorrent库加载失败，尝试备用加载');
-                var script = document.createElement('script');
-                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/webtorrent/1.8.1/webtorrent.min.js';
-                script.onload = function() {
-                    console.log('WebTorrent库备用加载成功');
-                    if (typeof initApp === 'function') initApp();
-                };
-                script.onerror = function() {
-                    console.error('WebTorrent备用库也加载失败');
-                    alert('网络连接组件加载失败，请刷新页面或检查网络连接');
-                };
-                document.head.appendChild(script);
-            } else {
-                console.log('WebTorrent库加载成功');
-            }
+            // 设置Buffer替代方案
+            window.Buffer = {
+                from: function(data, encoding) {
+                    if (typeof data === 'string') {
+                        const encoder = new TextEncoder();
+                        return encoder.encode(data);
+                    }
+                    return new Uint8Array(data);
+                },
+                isBuffer: function(obj) {
+                    return obj instanceof Uint8Array;
+                },
+                alloc: function(size) {
+                    return new Uint8Array(size);
+                }
+            };
+            window.appState.bufferLoaded = true;
+            
+            // 检查WebTorrent是否已加载
+            setTimeout(function() {
+                if (typeof WebTorrent === 'function') {
+                    console.log('WebTorrent库加载成功');
+                    window.appState.webtorrentLoaded = true;
+                } else {
+                    console.error('WebTorrent库加载失败，尝试备用源');
+                    loadBackupWebTorrent();
+                }
+            }, 1000);
         });
+        
+        // 加载备用WebTorrent
+        function loadBackupWebTorrent() {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.bootcdn.net/ajax/libs/webtorrent/1.8.0/webtorrent.min.js';
+            script.async = true;
+            document.head.appendChild(script);
+            
+            script.onload = function() {
+                console.log('备用WebTorrent库加载成功');
+                window.appState.webtorrentLoaded = true;
+                if (typeof initApp === 'function') {
+                    // 如果app.js已加载，立即初始化
+                    setTimeout(initApp, 500);
+                }
+            };
+            
+            script.onerror = function() {
+                console.error('备用WebTorrent库也加载失败');
+                showErrorStatus();
+            };
+        }
+        
+        // 显示错误状态
+        function showErrorStatus() {
+            setTimeout(() => {
+                const status = document.getElementById('connection-status');
+                if (status) {
+                    status.textContent = 'WebTorrent加载失败，只能使用本地模式';
+                    status.style.backgroundColor = '#f8d7da';
+                }
+            }, 1000);
+        }
     </script>
 </head>
 <body>
@@ -39,8 +88,9 @@
             <!-- P2P连接状态显示 -->
             <div class="connection-info">
                 <div id="connection-status">正在连接网络...</div>
-                <div id="room-info" style="display:none;">
-                    <input type="text" id="room-id" value="default-room">
+                <div id="connections-count" style="margin-top:5px;font-size:14px;"></div>
+                <div id="room-info" style="margin-top:5px;">
+                    <span style="font-size:13px;">固定房间ID: default-room</span>
                 </div>
             </div>
         </header>
