@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>分组管理表格</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>中国近现代史纲要分组</h1>
+        </header>
+
+        <main>
+            <div class="table-controls">
+                <div class="left-controls">
+                    <button id="add-group" class="primary-btn">添加新分组</button>
+                    <button id="export-data" class="export-btn">导出分组信息</button>
+                </div>
+                <div class="right-controls">
+                    <button id="save-local" class="save-btn">保存分组信息</button>
+                    <button id="load-local" class="primary-btn">加载保存的信息</button>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table id="group-table">
+                    <thead>
+                        <tr>
+                            <th>组名</th>
+                            <th>成员</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                        <!-- 表格内容将通过JS动态生成 -->
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- 未分组成员区域 -->
+            <div class="ungrouped-section">
+                <h2>公开求组区</h2>
+                <div class="ungrouped-controls">
+                    <input type="text" id="new-member-name" placeholder="输入姓名">
+                    <button id="add-ungrouped" class="add-btn">添加</button>
+                </div>
+                <div id="ungrouped-list" class="ungrouped-list">
+                    <!-- 未分组成员将在此动态生成 -->
+                </div>
+            </div>
+        </main>
+
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/uuid/8.3.2/uuid.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html> 
