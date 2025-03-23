@@ -58,6 +58,10 @@ function initApp() {
     isInitializing = true;
     
     try {
+        // 设置一个标记，表示是否是新用户（首次加载）
+        window.isNewUser = !localStorage.getItem('groupTableData');
+        console.log('是否为新用户:', window.isNewUser);
+        
         // 从localStorage加载数据
         loadData();
         
@@ -292,6 +296,10 @@ function joinRoom() {
         // 清理现有的种子
         cleanupExistingTorrents();
         
+        // 重置对等点
+        connectedPeers = {};
+        updatePeerList();
+        
         // 设置连接超时
         if (connectionTimeoutId) {
             clearTimeout(connectionTimeoutId);
@@ -300,7 +308,7 @@ function joinRoom() {
         connectionTimeoutId = setTimeout(() => {
             console.log('连接超时，创建固定种子');
             createFixedSeed();
-        }, 10000); // 10秒超时
+        }, 15000); // 增加到15秒等待时间
         
         // 尝试先加入已有的种子
         console.log('尝试加入固定种子:', FIXED_INFO_HASH);
@@ -315,8 +323,21 @@ function joinRoom() {
         
         console.log('加入房间使用磁力链接:', magnetUri);
         
+        // 显示连接状态
+        connectionStatus.textContent = '正在连接到跟踪服务器...';
+        
+        // 添加更多调试信息
+        client.on('warning', function(warning) {
+            console.log('WebTorrent警告:', warning);
+        });
+        
+        // 监听跟踪器事件
+        client.on('trackerEvent', function(eventName, data) {
+            console.log('跟踪器事件:', eventName, data);
+        });
+        
         // 尝试加入已有的种子
-        client.add(magnetUri, {}, function(t) {
+        client.add(magnetUri, { announce: ANNOUNCE_TRACKERS }, function(t) {
             // 清除超时
             if (connectionTimeoutId) {
                 clearTimeout(connectionTimeoutId);
@@ -327,10 +348,27 @@ function joinRoom() {
             torrent = t;
             setupTorrentEvents(torrent);
             updateRoomStatus();
-        }, function(err) {
-            console.error('加入现有种子失败, 创建新的固定种子:', err);
-            // 如果加入失败，创建新的固定种子
-            createFixedSeed();
+            
+            // 立即广播存在
+            setTimeout(() => {
+                broadcastData({
+                    type: 'ping',
+                    message: '新用户加入'
+                });
+            }, 1000);
+        }).on('error', function(err) {
+            console.error('加入现有种子失败:', err);
+            
+            // 清除超时，手动创建新的种子
+            if (connectionTimeoutId) {
+                clearTimeout(connectionTimeoutId);
+                connectionTimeoutId = null;
+            }
+            
+            // 创建新的固定种子
+            setTimeout(() => {
+                createFixedSeed();
+            }, 1000);
         });
     } catch (err) {
         console.error('加入房间失败:', err);
@@ -372,6 +410,9 @@ function createFixedSeed() {
             private: false
         };
         
+        // 更新状态显示
+        connectionStatus.textContent = '正在创建房间...';
+        
         // 添加种子
         client.seed(seedData, seedOpts, (seed) => {
             torrent = seed;
@@ -382,6 +423,11 @@ function createFixedSeed() {
             
             // 更新状态
             updateRoomStatus();
+            
+            // 定期检查连接状态
+            setInterval(() => {
+                checkConnectionStatus();
+            }, 30000);
         });
     } catch (err) {
         console.error('创建固定种子失败:', err);
@@ -390,6 +436,32 @@ function createFixedSeed() {
         // 即使连接失败也允许用户使用本地模式
         connectionStatus.textContent = '使用本地模式 (连接失败)';
         connectionStatus.style.backgroundColor = '#f8d7da';
+    }
+}
+
+// 检查连接状态并尝试恢复
+function checkConnectionStatus() {
+    // 如果没有连接的对等点，尝试重新广播
+    if (torrent && (!torrent.wires || torrent.wires.length === 0)) {
+        console.log('未检测到连接的对等点，尝试重新广播');
+        
+        // 发送一个ping消息到跟踪器
+        try {
+            if (torrent.announce) {
+                torrent.announce();
+                console.log('已向跟踪器宣告');
+            }
+            
+            // 如果有数据，广播存在
+            if (tableData && tableData.rows && tableData.rows.length > 0) {
+                broadcastData({
+                    type: 'ping',
+                    message: '重新广播'
+                });
+            }
+        } catch (e) {
+            console.error('重新广播失败:', e);
+        }
     }
 }
 
@@ -493,16 +565,30 @@ function setupTorrentEvents(t) {
                 connectedPeers[wire.peerId] = wire;
                 updatePeerList();
                 
+                // 如果是新用户，等待更长时间再请求同步
+                // 这样老用户有足够时间完成连接并能够回应
+                const syncDelay = window.isNewUser ? 5000 : 2000;
+                console.log(`新对等点连接，${syncDelay/1000}秒后请求同步数据`);
+                
                 // 发送当前数据给新连接的对等点
                 setTimeout(() => {
-                    sendSyncData(wire);
-                    
-                    // 向所有客户端广播同步请求
-                    broadcastData({
-                        type: 'syncRequest',
-                        message: '新客户端请求同步'
-                    });
-                }, 2000); // 延长延迟以确保连接完全稳定
+                    // 如果是新用户，先发送同步请求而不是空数据
+                    if (window.isNewUser || 
+                        !tableData || 
+                        !tableData.rows || 
+                        tableData.rows.length === 0) {
+                        console.log('作为新用户请求同步数据');
+                        // 向所有客户端广播同步请求
+                        broadcastData({
+                            type: 'syncRequest',
+                            message: '新客户端请求同步'
+                        });
+                    } else {
+                        // 已有数据的用户直接发送给新连接的对等点
+                        console.log('向新对等点发送同步数据');
+                        sendSyncData(wire);
+                    }
+                }, syncDelay);
             }
         } catch (err) {
             console.error('设置wire扩展失败:', err);
@@ -533,6 +619,14 @@ function setupTorrentEvents(t) {
     // 种子就绪事件
     t.on('ready', () => {
         console.log('种子就绪:', t.infoHash);
+        
+        // 种子就绪后，定期广播存在
+        setInterval(() => {
+            broadcastData({
+                type: 'ping',
+                message: '我在线'
+            });
+        }, 30000); // 每30秒发送一次ping，保持连接活跃
     });
 }
 
@@ -612,45 +706,18 @@ function setupMessageChannel(wire) {
                             }
                             console.log('收到的扩展消息前20字节(hex):', debugHex);
                             
-                            // 使用TextDecoder替代Buffer，防止require错误
-                            const decoder = new TextDecoder('utf-8', {fatal: false});
-                            const jsonStr = decoder.decode(buf);
-                            
-                            if (!jsonStr || jsonStr.length < 2) {
-                                console.warn('解码失败或数据太短');
+                            // 安全解码二进制数据
+                            const jsonStr = safeDecodeBuffer(buf);
+                            if (!jsonStr) {
+                                console.warn('无法解码扩展消息');
                                 return;
                             }
                             
-                            // 清理JSON字符串，去除可能的前缀字符
-                            let startPos = 0;
-                            while (startPos < jsonStr.length && 
-                                   !['[', '{', '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-'].includes(jsonStr[startPos])) {
-                                startPos++;
-                            }
-                            
-                            const cleanJson = jsonStr.slice(startPos);
-                            console.log('清理后的JSON前缀:', cleanJson.substring(0, 30) + (cleanJson.length > 30 ? '...' : ''));
-                            
-                            try {
-                                const data = JSON.parse(cleanJson);
+                            // 尝试解析并处理JSON数据
+                            const data = safeParseJSON(jsonStr);
+                            if (data) {
                                 console.log('成功解析扩展消息，类型:', data.type);
                                 handleDataReceived(data, wire);
-                            } catch (jsonErr) {
-                                console.error('JSON解析失败:', jsonErr.message);
-                                
-                                // 尝试用正则匹配有效JSON
-                                const match = cleanJson.match(/\{[\s\S]*\}/);
-                                if (match && match[0]) {
-                                    try {
-                                        const extractedData = JSON.parse(match[0]);
-                                        console.log('使用正则提取解析成功，类型:', extractedData.type);
-                                        handleDataReceived(extractedData, wire);
-                                    } catch (e) {
-                                        console.error('正则提取的JSON也解析失败:', e);
-                                    }
-                                } else {
-                                    console.error('无法找到有效的JSON对象');
-                                }
                             }
                         } catch (err) {
                             console.error('解析消息失败:', err);
@@ -695,57 +762,18 @@ function setupMessageChannel(wire) {
             }
             console.log('收到的extension消息前20个字节: ', debugStr);
             
-            // 尝试使用TextDecoder解码
-            const decoder = new TextDecoder('utf-8', {fatal: false});
-            const jsonStr = decoder.decode(buf);
-            
-            // 基本验证
-            if (!jsonStr || jsonStr.length < 2) {
-                console.warn('解码后的数据太短，不可能是有效的JSON');
+            // 安全解码二进制数据
+            const jsonStr = safeDecodeBuffer(buf);
+            if (!jsonStr) {
+                console.warn('无法解码extension消息');
                 return;
             }
             
-            console.log('解码后的JSON字符串前50个字符:', jsonStr.substring(0, 50));
-            
-            // 检查是否有BOM (Byte Order Mark)或其他非JSON前缀
-            let cleanJsonStr = jsonStr;
-            if (jsonStr.charCodeAt(0) === 0xFEFF) {
-                cleanJsonStr = jsonStr.slice(1); // 移除BOM
-            }
-            
-            // 移除可能的前缀非JSON字符
-            while (cleanJsonStr.length > 0 && !['[', '{', '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-'].includes(cleanJsonStr[0])) {
-                cleanJsonStr = cleanJsonStr.slice(1);
-                console.log('移除非JSON前缀字符，现在的JSON前缀:', cleanJsonStr.substring(0, 10));
-            }
-            
-            // 尝试解析清理后的JSON
-            try {
-                const data = JSON.parse(cleanJsonStr);
-                
-                // 确保解析出的数据是对象并具有type属性
-                if (data && typeof data === 'object' && data.type) {
-                    console.log('成功解析extension消息，类型:', data.type);
-                    handleDataReceived(data, wire);
-                } else {
-                    console.warn('解析出的数据无效，缺少type属性');
-                }
-            } catch (jsonErr) {
-                console.error('JSON解析失败，尝试替代解析方法:', jsonErr.message);
-                
-                // 尝试用正则表达式寻找JSON对象边界
-                const jsonMatch = cleanJsonStr.match(/(\{.*\})/s);
-                if (jsonMatch && jsonMatch[1]) {
-                    try {
-                        const extractedData = JSON.parse(jsonMatch[1]);
-                        console.log('使用正则提取解析成功，类型:', extractedData.type);
-                        handleDataReceived(extractedData, wire);
-                    } catch (e) {
-                        console.error('正则提取的JSON也解析失败:', e);
-                    }
-                } else {
-                    console.error('无法找到有效的JSON对象');
-                }
+            // 安全解析JSON数据
+            const data = safeParseJSON(jsonStr);
+            if (data) {
+                console.log('成功解析extension消息，类型:', data.type);
+                handleDataReceived(data, wire);
             }
         } catch (err) {
             console.error('处理extension消息失败:', err);
@@ -753,6 +781,177 @@ function setupMessageChannel(wire) {
     };
     
     return extension;
+}
+
+// 安全解码二进制数据为字符串
+function safeDecodeBuffer(buf) {
+    try {
+        if (!buf || buf.length === 0) {
+            console.warn('尝试解码空缓冲区');
+            return null;
+        }
+        
+        // 使用TextDecoder替代Buffer，防止require错误
+        const decoder = new TextDecoder('utf-8', {fatal: false});
+        const jsonStr = decoder.decode(buf);
+        
+        // 基本验证
+        if (!jsonStr || jsonStr.length < 2) {
+            console.warn('解码后的数据太短，不可能是有效的JSON');
+            return null;
+        }
+        
+        console.log('解码后的JSON字符串前50个字符:', jsonStr.substring(0, 50));
+        return jsonStr;
+    } catch (err) {
+        console.error('解码二进制数据失败:', err);
+        return null;
+    }
+}
+
+// 安全地解析JSON字符串
+function safeParseJSON(jsonStr) {
+    try {
+        if (!jsonStr || typeof jsonStr !== 'string') {
+            console.warn('尝试解析非字符串数据');
+            return null;
+        }
+        
+        // 检查是否有BOM (Byte Order Mark)或其他非JSON前缀
+        let cleanJsonStr = jsonStr;
+        
+        // 移除UTF-8 BOM
+        if (cleanJsonStr.charCodeAt(0) === 0xFEFF) {
+            cleanJsonStr = cleanJsonStr.slice(1);
+            console.log('移除了UTF-8 BOM前缀');
+        }
+        
+        // 如果JSON字符串有非标准字符前缀，尝试找到第一个JSON有效字符
+        let startPos = 0;
+        while (startPos < cleanJsonStr.length && 
+               !['[', '{', '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-'].includes(cleanJsonStr[startPos])) {
+            startPos++;
+        }
+        
+        if (startPos > 0) {
+            console.log(`移除了${startPos}个非JSON前缀字符`);
+            cleanJsonStr = cleanJsonStr.slice(startPos);
+        }
+        
+        // 查找额外字符可能附加在JSON后面
+        let endPos = cleanJsonStr.length - 1;
+        let foundEnd = false;
+        
+        // 尝试找到最后一个JSON结束字符 ('}' 或 ']')
+        for (let i = cleanJsonStr.length - 1; i >= 0; i--) {
+            if (cleanJsonStr[i] === '}' || cleanJsonStr[i] === ']') {
+                endPos = i;
+                foundEnd = true;
+                break;
+            }
+        }
+        
+        if (foundEnd && endPos < cleanJsonStr.length - 1) {
+            console.log(`移除了${cleanJsonStr.length - endPos - 1}个非JSON后缀字符`);
+            cleanJsonStr = cleanJsonStr.slice(0, endPos + 1);
+        }
+        
+        // 尝试直接解析清理后的JSON
+        try {
+            return JSON.parse(cleanJsonStr);
+        } catch (directError) {
+            console.warn('直接解析JSON失败，尝试使用正则表达式:', directError.message);
+            
+            // 尝试用正则表达式找到有效的JSON对象或数组
+            const objMatch = cleanJsonStr.match(/(\{.*\})/s);
+            const arrMatch = cleanJsonStr.match(/(\[.*\])/s);
+            
+            if (objMatch && objMatch[1]) {
+                try {
+                    const data = JSON.parse(objMatch[1]);
+                    console.log('使用正则提取JSON对象成功');
+                    return data;
+                } catch (e) {
+                    console.error('正则提取的JSON对象解析失败:', e);
+                }
+            }
+            
+            if (arrMatch && arrMatch[1]) {
+                try {
+                    const data = JSON.parse(arrMatch[1]);
+                    console.log('使用正则提取JSON数组成功');
+                    return data;
+                } catch (e) {
+                    console.error('正则提取的JSON数组解析失败:', e);
+                }
+            }
+            
+            // 尝试逐字符分析修复JSON
+            console.log('尝试高级JSON修复');
+            try {
+                // 寻找开始的 { 或 [
+                let start = cleanJsonStr.indexOf('{');
+                if (start === -1) start = cleanJsonStr.indexOf('[');
+                if (start === -1) {
+                    console.error('找不到JSON开始标记');
+                    return null;
+                }
+                
+                // 找到对应的结束括号
+                let end = -1;
+                let openBrackets = 0;
+                let inString = false;
+                let escapeNext = false;
+                
+                for (let i = start; i < cleanJsonStr.length; i++) {
+                    const c = cleanJsonStr[i];
+                    
+                    if (escapeNext) {
+                        escapeNext = false;
+                        continue;
+                    }
+                    
+                    if (c === '\\' && inString) {
+                        escapeNext = true;
+                        continue;
+                    }
+                    
+                    if (c === '"' && !escapeNext) {
+                        inString = !inString;
+                        continue;
+                    }
+                    
+                    if (inString) continue;
+                    
+                    if (c === '{' || c === '[') {
+                        openBrackets++;
+                    } else if (c === '}' || c === ']') {
+                        openBrackets--;
+                        if (openBrackets === 0) {
+                            end = i;
+                            break;
+                        }
+                    }
+                }
+                
+                if (end === -1) {
+                    console.error('找不到匹配的JSON结束标记');
+                    return null;
+                }
+                
+                const extractedJson = cleanJsonStr.substring(start, end + 1);
+                console.log('提取出可能的JSON:', extractedJson.substring(0, 30) + '...');
+                
+                return JSON.parse(extractedJson);
+            } catch (advancedError) {
+                console.error('高级JSON修复失败:', advancedError);
+                return null;
+            }
+        }
+    } catch (err) {
+        console.error('解析JSON失败:', err);
+        return null;
+    }
 }
 
 // 发送同步数据给对等点
@@ -1544,13 +1743,35 @@ function handleDataReceived(data, wire) {
         if (data.type === 'sync') {
             // 完整数据同步
             console.log('接收到同步数据，表格行数:', data.tableData?.rows?.length);
+            
+            // 如果接收到的数据为空，但本地已有数据，不进行覆盖
+            if ((!data.tableData || data.tableData.rows.length === 0) && 
+                tableData && tableData.rows && tableData.rows.length > 0) {
+                console.log('收到空数据但本地有数据，忽略此同步');
+                
+                // 反向发送我们的数据给发送者
+                if (wire && wire.sendMessage) {
+                    console.log('发送我们的数据回给对方');
+                    setTimeout(() => {
+                        sendSyncData(wire);
+                    }, 1000);
+                }
+                return;
+            }
+            
             tableData = data.tableData;
             ungroupedMembers = data.ungroupedMembers;
             renderTable();
             renderUngroupedMembers();
             
-            // 保存到本地存储
-            saveToLocalStorage();
+            // 只有在收到有效数据后才保存到本地
+            if (tableData && tableData.rows && tableData.rows.length > 0) {
+                saveToLocalStorage();
+                console.log('已同步并保存外部数据');
+                
+                // 标记不再是新用户
+                window.isNewUser = false;
+            }
             
             // 回复一个确认收到的消息
             if (wire && wire.sendMessage) {
@@ -1564,8 +1785,13 @@ function handleDataReceived(data, wire) {
         } else if (data.type === 'syncRequest') {
             // 同步请求 - 有新客户端连接，发送当前数据
             console.log('收到同步请求，发送当前数据');
-            if (wire && wire.sendMessage) {
-                sendSyncData(wire);
+            // 只有当本地有数据时才发送同步数据
+            if (tableData && tableData.rows && tableData.rows.length > 0) {
+                if (wire && wire.sendMessage) {
+                    sendSyncData(wire);
+                }
+            } else {
+                console.log('本地无数据，不响应同步请求');
             }
         } else if (data.type === 'syncAck') {
             // 同步确认 - 无需操作，仅记录
