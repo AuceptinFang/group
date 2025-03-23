@@ -2,149 +2,96 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>分组管理表格</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>小组管理工具</title>
     <link rel="stylesheet" href="styles.css">
+    <!-- 添加兼容性元标签 -->
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     
-    <!-- WebTorrent直接集成 -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/webtorrent/1.8.0/webtorrent.min.js"></script>
+    <!-- 先加载Buffer -->
+    <script src="https://cdn.jsdelivr.net/npm/buffer@6.0.3/index.min.js"></script>
+    
+    <!-- 使用UMD版本的WebTorrent，更好的兼容性 -->
+    <script src="https://cdn.jsdelivr.net/npm/webtorrent@1.8.0/webtorrent.min.js"></script>
+    
+    <!-- 添加失败时的备用CDN -->
     <script>
-        // WebTorrent初始化状态跟踪
-        window.appState = {
-            webtorrentLoaded: false,
-            bufferLoaded: false
-        };
-        
         // 检查WebTorrent是否成功加载
-        window.addEventListener('DOMContentLoaded', function() {
-            // 设置Buffer替代方案
-            window.Buffer = {
-                from: function(data, encoding) {
-                    if (typeof data === 'string') {
-                        const encoder = new TextEncoder();
-                        return encoder.encode(data);
-                    }
-                    return new Uint8Array(data);
-                },
-                isBuffer: function(obj) {
-                    return obj instanceof Uint8Array;
-                },
-                alloc: function(size) {
-                    return new Uint8Array(size);
-                }
-            };
-            window.appState.bufferLoaded = true;
-            
-            // 检查WebTorrent是否已加载
-            setTimeout(function() {
-                if (typeof WebTorrent === 'function') {
-                    console.log('WebTorrent库加载成功');
-                    window.appState.webtorrentLoaded = true;
-                } else {
-                    console.error('WebTorrent库加载失败，尝试备用源');
-                    loadBackupWebTorrent();
-                }
-            }, 1000);
-        });
-        
-        // 加载备用WebTorrent
-        function loadBackupWebTorrent() {
-            const script = document.createElement('script');
-            script.src = 'https://cdn.bootcdn.net/ajax/libs/webtorrent/1.8.0/webtorrent.min.js';
-            script.async = true;
-            document.head.appendChild(script);
-            
-            script.onload = function() {
-                console.log('备用WebTorrent库加载成功');
-                window.appState.webtorrentLoaded = true;
-                if (typeof initApp === 'function') {
-                    // 如果app.js已加载，立即初始化
-                    setTimeout(initApp, 500);
-                }
-            };
-            
-            script.onerror = function() {
-                console.error('备用WebTorrent库也加载失败');
-                showErrorStatus();
-            };
-        }
-        
-        // 显示错误状态
-        function showErrorStatus() {
-            setTimeout(() => {
-                const status = document.getElementById('connection-status');
-                if (status) {
-                    status.textContent = 'WebTorrent加载失败，只能使用本地模式';
-                    status.style.backgroundColor = '#f8d7da';
-                }
-            }, 1000);
-        }
+        setTimeout(function() {
+            if (typeof WebTorrent !== 'function') {
+                console.log('主CDN加载WebTorrent失败，尝试备用CDN');
+                
+                // 从备用CDN加载
+                var script = document.createElement('script');
+                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/webtorrent/1.8.0/webtorrent.min.js';
+                script.onload = function() {
+                    console.log('从备用CDN成功加载WebTorrent');
+                };
+                script.onerror = function() {
+                    console.error('备用CDN也加载失败，尝试本地模式');
+                    document.getElementById('connection-status').textContent = 'WebTorrent加载失败，只能使用本地模式';
+                    document.getElementById('connection-status').style.backgroundColor = '#f8d7da';
+                };
+                document.head.appendChild(script);
+            }
+        }, 2000);
     </script>
+    
+    <!-- UUID库 -->
+    <script src="https://cdn.jsdelivr.net/npm/uuid@8.3.2/dist/umd/uuidv4.min.js"></script>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>中国近现代史纲要分组</h1>
-            <!-- P2P连接状态显示 -->
-            <div class="connection-info">
-                <div id="connection-status">正在连接网络...</div>
-                <div id="connections-count" style="margin-top:5px;font-size:14px;"></div>
-                <div id="room-info" style="margin-top:5px;">
-                    <span style="font-size:13px;">固定房间ID: default-room</span>
-                </div>
+    <header>
+        <h1>小组管理工具</h1>
+        <div class="controls">
+            <button id="add-group" class="primary-btn">添加新分组</button>
+            <button id="save-local" class="save-btn">保存到本地</button>
+            <button id="load-local" class="load-btn">加载</button>
+            <button id="export-data" class="export-btn">导出数据</button>
+        </div>
+        
+        <div class="connection-container">
+            <div id="connection-status">正在初始化连接...</div>
+            <div class="peers-container">
+                <div id="connections-count">连接中...</div>
+                <div id="peer-list"></div>
             </div>
-        </header>
-
-        <main>
-            <div class="table-controls">
-                <div class="left-controls">
-                    <button id="add-group" class="primary-btn">添加新分组</button>
-                    <button id="export-data" class="export-btn">导出分组信息</button>
-                </div>
-                <div class="right-controls">
-                    <button id="save-local" class="save-btn">保存分组信息</button>
-                    <button id="load-local" class="primary-btn">加载保存的信息</button>
-                </div>
+        </div>
+    </header>
+    
+    <main>
+        <section class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th width="25%">组名</th>
+                        <th width="50%">成员</th>
+                        <th width="25%">操作</th>
+                    </tr>
+                </thead>
+                <tbody id="table-body">
+                    <!-- 表格内容将通过JavaScript动态生成 -->
+                </tbody>
+            </table>
+        </section>
+        
+        <section class="ungrouped-section">
+            <h2>未分组成员</h2>
+            <div class="add-ungrouped">
+                <input type="text" id="new-member-name" placeholder="输入成员姓名">
+                <button id="add-ungrouped" class="primary-btn">添加</button>
             </div>
-
-            <div class="table-container">
-                <table id="group-table">
-                    <thead>
-                        <tr>
-                            <th>组名</th>
-                            <th>成员</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="table-body">
-                        <!-- 表格内容将通过JS动态生成 -->
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- 未分组成员区域 -->
-            <div class="ungrouped-section">
-                <h2>公开求组区</h2>
-                <div class="ungrouped-controls">
-                    <input type="text" id="new-member-name" placeholder="输入姓名">
-                    <button id="add-ungrouped" class="add-btn">添加</button>
-                </div>
-                <div id="ungrouped-list" class="ungrouped-list">
-                    <!-- 未分组成员将在此动态生成 -->
-                </div>
-            </div>
-
-            <div id="connected-peers">
-                <h3>已连接用户</h3>
-                <div id="peer-list" class="peer-list">
-                    <!-- 连接的用户将在此显示 -->
-                </div>
-            </div>
-        </main>
-
-    </div>
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/uuid/8.3.2/uuid.min.js"></script>
+            <div id="ungrouped-list" class="ungrouped-list"></div>
+        </section>
+    </main>
+    
+    <footer>
+        <p>小组管理工具 | 使用WebTorrent实现P2P同步</p>
+        <p>连接问题请刷新页面或检查网络</p>
+    </footer>
+    
     <script src="app.js"></script>
 </body>
 </html> 

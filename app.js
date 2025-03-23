@@ -22,10 +22,15 @@ const FIXED_SEED_DATA = JSON.stringify({
     createdAt: '2023-10-10T00:00:00.000Z' // 固定的创建时间
 });
 
-// 跟踪器列表
+// 扩展跟踪器列表，增加连接成功率
 const ANNOUNCE_TRACKERS = [
     'wss://tracker.btorrent.xyz',
-    'wss://tracker.openwebtorrent.com'
+    'wss://tracker.openwebtorrent.com',
+    'wss://tracker.webtorrent.dev',
+    'wss://tracker.files.fm:7073/announce',
+    'wss://spacetradersapi-chatbox.herokuapp.com:443/announce',
+    'wss://tracker.sloppyta.co:443/announce',
+    'wss://peertube.cpy.re:443/tracker/socket'
 ];
 
 let reconnectAttempts = 0; // 连接尝试次数
@@ -33,6 +38,11 @@ let isInitializing = false; // 是否正在初始化WebTorrent
 let webtorrentInitialized = false; // WebTorrent是否已初始化
 let isBufferAvailable = false; // Buffer是否可用
 let connectionTimeoutId = null; // 连接超时定时器ID
+
+// 设置连接超时和重试间隔
+const CONNECTION_TIMEOUT = 20000; // 20秒
+const RETRY_INTERVAL = 3000; // 3秒
+const MAX_RECONNECT_ATTEMPTS = 5; // 最大重连次数
 
 // DOM元素
 const addGroupBtn = document.getElementById('add-group');
@@ -61,6 +71,10 @@ function initApp() {
         // 设置一个标记，表示是否是新用户（首次加载）
         window.isNewUser = !localStorage.getItem('groupTableData');
         console.log('是否为新用户:', window.isNewUser);
+        
+        // 设置锁定标志，防止新用户立即同步空数据
+        window.syncLocked = window.isNewUser;
+        console.log('同步锁定状态:', window.syncLocked);
         
         // 从localStorage加载数据
         loadData();
@@ -200,14 +214,22 @@ function initWebTorrent() {
         
         // 尝试实例化WebTorrent客户端
         try {
-            // 创建WebTorrent客户端
+            // 创建WebTorrent客户端，添加更多配置以提高连接成功率
             console.log('创建WebTorrent客户端');
             client = new WebTorrent({
                 tracker: {
-                    announce: ANNOUNCE_TRACKERS
+                    announce: ANNOUNCE_TRACKERS,
+                    rtcConfig: {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:global.stun.twilio.com:3478' }
+                        ],
+                        sdpSemantics: 'unified-plan'
+                    }
                 },
-                maxConns: 50,  // 增加最大连接数
-                dht: false     // 禁用DHT以简化连接
+                maxConns: 100,  // 增加最大连接数
+                dht: false,     // 禁用DHT以简化连接
+                webSeeds: true  // 启用WebSeed支持
             });
             
             if (!client) {
@@ -234,12 +256,12 @@ function initWebTorrent() {
                 connectionStatus.classList.remove('connected');
                 
                 // 尝试重新连接
-                if (reconnectAttempts < 3) {
+                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                     reconnectAttempts++;
                     console.log(`连接出错，第${reconnectAttempts}次重试...`);
                     setTimeout(() => {
                         joinRoom();
-                    }, 2000);
+                    }, RETRY_INTERVAL);
                 }
             });
             
@@ -249,6 +271,11 @@ function initWebTorrent() {
                 if (t !== torrent) {
                     setupTorrentEvents(t);
                 }
+            });
+            
+            // 添加对等点发现事件
+            client.on('peerDiscovery', () => {
+                console.log('发现新的对等点');
             });
             
             // 成功创建客户端后自动加入房间
@@ -308,7 +335,7 @@ function joinRoom() {
         connectionTimeoutId = setTimeout(() => {
             console.log('连接超时，创建固定种子');
             createFixedSeed();
-        }, 15000); // 增加到15秒等待时间
+        }, CONNECTION_TIMEOUT); // 增加到20秒等待时间
         
         // 尝试先加入已有的种子
         console.log('尝试加入固定种子:', FIXED_INFO_HASH);
@@ -336,8 +363,12 @@ function joinRoom() {
             console.log('跟踪器事件:', eventName, data);
         });
         
-        // 尝试加入已有的种子
-        client.add(magnetUri, { announce: ANNOUNCE_TRACKERS }, function(t) {
+        // 尝试加入已有的种子，使用更多选项提高成功率
+        client.add(magnetUri, { 
+            announce: ANNOUNCE_TRACKERS,
+            maxWebConns: 20,
+            private: false
+        }, function(t) {
             // 清除超时
             if (connectionTimeoutId) {
                 clearTimeout(connectionTimeoutId);
@@ -355,6 +386,18 @@ function joinRoom() {
                     type: 'ping',
                     message: '新用户加入'
                 });
+                
+                // 定期宣告到跟踪器，提高发现率
+                setInterval(() => {
+                    if (torrent && torrent.announce) {
+                        try {
+                            torrent.announce();
+                            console.log('已重新宣告到跟踪器');
+                        } catch (e) {
+                            console.warn('宣告失败:', e);
+                        }
+                    }
+                }, 30000); // 每30秒宣告一次
             }, 1000);
         }).on('error', function(err) {
             console.error('加入现有种子失败:', err);
@@ -957,6 +1000,12 @@ function safeParseJSON(jsonStr) {
 // 发送同步数据给对等点
 function sendSyncData(wire) {
     try {
+        // 如果是新用户或同步锁定期间，不发送数据
+        if (window.syncLocked) {
+            console.log('同步被锁定，不发送数据');
+            return;
+        }
+        
         if (!wire) {
             console.error('无法发送同步数据: wire对象为空');
             return;
@@ -964,6 +1013,12 @@ function sendSyncData(wire) {
         
         if (typeof wire.sendMessage !== 'function') {
             console.error('无法发送同步数据: sendMessage不是函数', wire);
+            return;
+        }
+        
+        // 检查本地数据是否为空
+        if (!tableData || !tableData.rows || tableData.rows.length === 0) {
+            console.log('本地数据为空，不发送同步数据');
             return;
         }
         
@@ -1009,6 +1064,18 @@ function sendSyncData(wire) {
 // 广播数据给所有连接的对等点
 function broadcastData(data) {
     try {
+        // 新用户在锁定期间只允许发送syncRequest和ping类型消息
+        if (window.syncLocked && data.type !== 'syncRequest' && data.type !== 'ping') {
+            console.log('同步锁定期间，只允许发送syncRequest和ping消息，当前尝试发送:', data.type);
+            return;
+        }
+        
+        // 如果是sync类型消息，并且本地数据为空，不广播
+        if (data.type === 'sync' && (!tableData || !tableData.rows || tableData.rows.length === 0)) {
+            console.log('本地数据为空，不广播sync消息');
+            return;
+        }
+        
         // 添加发送者ID和时间戳
         data.from = myPeerId;
         data.timestamp = Date.now();
@@ -1759,18 +1826,24 @@ function handleDataReceived(data, wire) {
                 return;
             }
             
-            tableData = data.tableData;
-            ungroupedMembers = data.ungroupedMembers;
-            renderTable();
-            renderUngroupedMembers();
-            
-            // 只有在收到有效数据后才保存到本地
-            if (tableData && tableData.rows && tableData.rows.length > 0) {
+            // 检查接收到的数据是否有效
+            if (data.tableData && data.tableData.rows && data.tableData.rows.length > 0) {
+                // 有效数据，接收并保存
+                tableData = data.tableData;
+                ungroupedMembers = data.ungroupedMembers || [];
+                renderTable();
+                renderUngroupedMembers();
+                
+                // 保存到本地
                 saveToLocalStorage();
                 console.log('已同步并保存外部数据');
                 
-                // 标记不再是新用户
+                // 标记不再是新用户，解除同步锁定
                 window.isNewUser = false;
+                window.syncLocked = false;
+                console.log('接收到有效数据，解除同步锁定');
+            } else {
+                console.log('接收到的同步数据为空，不操作');
             }
             
             // 回复一个确认收到的消息
@@ -1792,6 +1865,30 @@ function handleDataReceived(data, wire) {
                 }
             } else {
                 console.log('本地无数据，不响应同步请求');
+            }
+        } else if (data.type === 'ping') {
+            // 新用户接收到ping消息，请求同步
+            if (window.isNewUser && data.from !== myPeerId) {
+                console.log('收到ping消息，作为新用户请求数据同步');
+                
+                // 向发送ping的用户请求数据
+                if (wire && wire.sendMessage) {
+                    wire.sendMessage({
+                        type: 'syncRequest',
+                        from: myPeerId,
+                        timestamp: Date.now(),
+                        message: '新用户请求数据同步'
+                    });
+                }
+            }
+            // 将对方添加到连接列表
+            if (data.from && data.from !== myPeerId && !connectedPeers[data.from]) {
+                console.log('从ping消息添加新对等点:', data.from);
+                if (wire) {
+                    wire.peerId = data.from;
+                    connectedPeers[data.from] = wire;
+                    updatePeerList();
+                }
             }
         } else if (data.type === 'syncAck') {
             // 同步确认 - 无需操作，仅记录
@@ -1943,12 +2040,17 @@ function saveData() {
     saveBtn.textContent = '✓ 已保存';
     saveBtn.style.backgroundColor = '#27ae60';
     
-    // 广播当前数据
-    broadcastData({
-        type: 'sync',
-        tableData: tableData,
-        ungroupedMembers: ungroupedMembers
-    });
+    // 只有非锁定时才广播数据
+    if (!window.syncLocked && tableData && tableData.rows && tableData.rows.length > 0) {
+        // 广播当前数据
+        broadcastData({
+            type: 'sync',
+            tableData: tableData,
+            ungroupedMembers: ungroupedMembers
+        });
+    } else {
+        console.log('同步锁定中或数据为空，不广播保存的数据');
+    }
     
     setTimeout(() => {
         saveBtn.textContent = originalText;
