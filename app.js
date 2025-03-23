@@ -4,6 +4,11 @@ let tableData = { // 表格数据
     rows: [] // 行数据
 };
 let ungroupedMembers = []; // 未分组成员列表
+let client = null; // WebTorrent客户端实例
+let torrent = null; // 当前种子实例
+let connectedPeers = {}; // 存储已连接的对等点
+let myPeerId = null; // 我的唯一ID
+let roomId = 'default-room'; // 默认房间ID
 
 // DOM元素
 const addGroupBtn = document.getElementById('add-group');
@@ -15,12 +20,260 @@ const ungroupedList = document.getElementById('ungrouped-list');
 const newMemberInput = document.getElementById('new-member-name');
 const addUngroupedBtn = document.getElementById('add-ungrouped');
 
+// WebTorrent连接相关元素
+const connectionStatus = document.getElementById('connection-status');
+const roomIdInput = document.getElementById('room-id');
+const joinRoomBtn = document.getElementById('join-room');
+const peerList = document.getElementById('peer-list');
+
 // 初始化函数
 function init() {
-    setupEventListeners();
-    loadFromLocalStorage();
+    // 添加事件监听
+    addGroupBtn.addEventListener('click', addNewGroup);
+    document.getElementById('save-local').addEventListener('click', saveData);
+    document.getElementById('load-local').addEventListener('click', loadStoredData);
+    exportDataBtn.addEventListener('click', exportGroupData);
+    addUngroupedBtn.addEventListener('click', addUngroupedMember);
+    
+    // 未分组成员输入框回车事件
+    newMemberInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            addUngroupedMember();
+        }
+    });
+    
+    // WebTorrent连接事件
+    joinRoomBtn.addEventListener('click', joinRoom);
+    
+    // 从localStorage加载数据
+    loadData();
+    
+    // 渲染表格和未分组成员
     renderTable();
     renderUngroupedMembers();
+    
+    // 初始化WebTorrent
+    initWebTorrent();
+    
+    // 生成唯一的对等点ID
+    myPeerId = generatePeerId();
+}
+
+// 生成唯一的对等点ID
+function generatePeerId() {
+    return 'peer-' + Math.random().toString(36).substr(2, 9);
+}
+
+// 初始化WebTorrent
+function initWebTorrent() {
+    try {
+        // 创建WebTorrent客户端
+        client = new WebTorrent();
+        connectionStatus.textContent = '准备就绪，请输入房间ID并加入';
+        
+        // 设置WebTorrent事件监听
+        client.on('error', (err) => {
+            console.error('WebTorrent错误:', err);
+            connectionStatus.textContent = '连接错误: ' + err.message;
+            connectionStatus.classList.remove('connected');
+        });
+        
+        // 使用之前保存的房间ID(如果有)
+        const savedRoomId = localStorage.getItem('roomId');
+        if (savedRoomId) {
+            roomIdInput.value = savedRoomId;
+        }
+        
+    } catch (err) {
+        console.error('初始化WebTorrent失败:', err);
+        connectionStatus.textContent = 'WebTorrent初始化失败';
+    }
+}
+
+// 加入房间
+function joinRoom() {
+    if (!client) {
+        alert('WebTorrent客户端未初始化，请刷新页面重试');
+        return;
+    }
+    
+    // 获取房间ID
+    roomId = roomIdInput.value.trim();
+    if (!roomId) {
+        alert('请输入有效的房间ID');
+        return;
+    }
+    
+    // 保存房间ID到本地存储
+    localStorage.setItem('roomId', roomId);
+    
+    connectionStatus.textContent = '正在连接到房间...';
+    
+    // 创建种子的磁力链接/信息哈希
+    // 我们使用房间ID作为种子的唯一标识符
+    const magnetURI = `magnet:?xt=urn:btih:${roomId}`;
+    
+    // 检查是否已经有对应的种子
+    if (torrent) {
+        // 如果已有种子，先移除
+        client.remove(torrent);
+        connectedPeers = {};
+        updatePeerList();
+    }
+    
+    try {
+        // 使用WebTorrent加入/创建对应的种子
+        client.seed(new Blob([JSON.stringify({
+            id: myPeerId,
+            time: Date.now()
+        })]), { 
+            name: roomId,
+            announce: [
+                'wss://tracker.openwebtorrent.com',
+                'wss://tracker.btorrent.xyz'
+            ]
+        }, (seed) => {
+            torrent = seed;
+            console.log('创建种子成功:', torrent.magnetURI);
+            
+            // 设置种子事件监听
+            setupTorrentEvents(torrent);
+            
+            // 同时也加入这个种子以接收其他对等点的数据
+            client.add(magnetURI, { announce: [
+                'wss://tracker.openwebtorrent.com',
+                'wss://tracker.btorrent.xyz'
+            ]}, (download) => {
+                // 如果是新的种子，设置事件监听
+                if (download !== torrent) {
+                    setupTorrentEvents(download);
+                }
+            });
+            
+            connectionStatus.textContent = '已连接到房间';
+            connectionStatus.classList.add('connected');
+        });
+    } catch (err) {
+        console.error('加入房间失败:', err);
+        connectionStatus.textContent = '加入房间失败: ' + err.message;
+    }
+}
+
+// 设置种子事件监听
+function setupTorrentEvents(t) {
+    // 对等点连接事件
+    t.on('wire', (wire) => {
+        console.log('新的对等点连接:', wire.peerId);
+        
+        // 设置数据通道
+        wire.use(setupMessageChannel(wire));
+        
+        // 更新对等点列表
+        if (wire.peerId && !connectedPeers[wire.peerId]) {
+            connectedPeers[wire.peerId] = wire;
+            updatePeerList();
+            
+            // 发送当前数据给新连接的对等点
+            setTimeout(() => {
+                sendSyncData(wire);
+            }, 1000); // 稍微延迟以确保连接稳定
+        }
+    });
+    
+    // 对等点断开连接事件
+    t.on('wire-disconnect', (wire) => {
+        console.log('对等点断开连接:', wire.peerId);
+        
+        // 更新对等点列表
+        if (wire.peerId && connectedPeers[wire.peerId]) {
+            delete connectedPeers[wire.peerId];
+            updatePeerList();
+        }
+    });
+    
+    // 完成下载事件
+    t.on('done', () => {
+        console.log('种子下载完成');
+    });
+    
+    // 错误事件
+    t.on('error', (err) => {
+        console.error('种子错误:', err);
+    });
+}
+
+// 设置消息通道
+function setupMessageChannel(wire) {
+    return function(wire) {
+        // 实现自定义消息协议
+        wire.extendedHandshake.messageChannel = true;
+        
+        // 接收到扩展握手
+        wire.on('extended', (ext, buf) => {
+            if (ext === 'message') {
+                try {
+                    const data = JSON.parse(buf.toString());
+                    handleDataReceived(data, wire);
+                } catch (err) {
+                    console.error('解析消息失败:', err);
+                }
+            }
+        });
+        
+        // 添加发送消息的方法
+        wire.sendMessage = (data) => {
+            const buf = Buffer.from(JSON.stringify(data));
+            wire.extended('message', buf);
+        };
+    };
+}
+
+// 发送同步数据给对等点
+function sendSyncData(wire) {
+    if (wire && wire.sendMessage) {
+        const syncData = {
+            type: 'sync',
+            from: myPeerId,
+            tableData: tableData,
+            ungroupedMembers: ungroupedMembers
+        };
+        wire.sendMessage(syncData);
+    }
+}
+
+// 广播数据给所有连接的对等点
+function broadcastData(data) {
+    data.from = myPeerId; // 添加发送者ID
+    
+    Object.values(connectedPeers).forEach(wire => {
+        if (wire && wire.sendMessage) {
+            wire.sendMessage(data);
+        }
+    });
+}
+
+// 更新连接用户列表
+function updatePeerList() {
+    peerList.innerHTML = '';
+    
+    const peerCount = Object.keys(connectedPeers).length;
+    if (peerCount > 0) {
+        // 显示连接用户数量
+        const countInfo = document.createElement('div');
+        countInfo.textContent = `已连接 ${peerCount} 个用户`;
+        countInfo.style.marginBottom = '8px';
+        countInfo.style.color = '#0288d1';
+        peerList.appendChild(countInfo);
+    }
+    
+    Object.keys(connectedPeers).forEach(peerId => {
+        const peerElement = document.createElement('div');
+        peerElement.className = 'peer-tag';
+        // 显示ID的一部分
+        peerElement.textContent = peerId.substring(0, 8);
+        peerElement.title = peerId;
+        peerList.appendChild(peerElement);
+    });
 }
 
 // 渲染表格
@@ -133,10 +386,107 @@ function renderUngroupedMembers() {
         const memberTag = document.createElement('span');
         memberTag.className = 'member-tag unassigned-tag';
         memberTag.textContent = member;
-        memberTag.addEventListener('click', () => removeUngroupedMember(member));
+        memberTag.addEventListener('click', () => handleUngroupedMemberClick(member));
         
         ungroupedList.appendChild(memberTag);
     });
+}
+
+// 处理未分组成员点击
+function handleUngroupedMemberClick(member) {
+    const action = confirm(`请选择操作:\n点击"确定"将 ${member} 添加到分组\n点击"取消"从未分组列表中删除`);
+    
+    if (action) {
+        // 添加到组
+        if (tableData.rows.length === 0) {
+            alert('暂无可用分组，请先创建分组');
+            return;
+        }
+        
+        // 创建组选择菜单
+        let groupOptions = '';
+        tableData.rows.forEach(row => {
+            groupOptions += `<option value="${row.id}">${row['组名']}</option>`;
+        });
+        
+        const selectHtml = `
+            <label for="select-group">选择要添加到的组:</label><br>
+            <select id="select-group">${groupOptions}</select>
+        `;
+        
+        // 使用自定义对话框
+        const dialogContainer = document.createElement('div');
+        dialogContainer.className = 'export-overlay';
+        dialogContainer.innerHTML = `
+            <div class="export-modal">
+                <div class="export-header">
+                    <h3>选择分组</h3>
+                    <button class="close-modal">&times;</button>
+                </div>
+                <div class="export-content">
+                    ${selectHtml}
+                </div>
+                <div class="export-buttons">
+                    <button class="primary-btn" id="confirm-group">确定</button>
+                    <button class="delete-btn" id="cancel-group">取消</button>
+                </div>
+            </div>
+        `;
+        
+        document.body.appendChild(dialogContainer);
+        
+        // 处理对话框事件
+        document.querySelector('.close-modal').addEventListener('click', () => {
+            document.body.removeChild(dialogContainer);
+        });
+        
+        document.getElementById('cancel-group').addEventListener('click', () => {
+            document.body.removeChild(dialogContainer);
+        });
+        
+        document.getElementById('confirm-group').addEventListener('click', () => {
+            const selectedGroupId = document.getElementById('select-group').value;
+            if (selectedGroupId) {
+                moveUngroupedToGroup(member, selectedGroupId);
+            }
+            document.body.removeChild(dialogContainer);
+        });
+    } else {
+        // 删除
+        if (confirm(`确定要删除 ${member} 吗？`)) {
+            removeUngroupedMember(member);
+        }
+    }
+}
+
+// 将未分组成员移动到组
+function moveUngroupedToGroup(member, groupId) {
+    const index = ungroupedMembers.indexOf(member);
+    if (index !== -1) {
+        // 从未分组列表中移除
+        ungroupedMembers.splice(index, 1);
+        renderUngroupedMembers();
+        
+        // 添加到选中的组
+        const rowIndex = tableData.rows.findIndex(row => row.id === groupId);
+        if (rowIndex !== -1) {
+            const currentMembers = tableData.rows[rowIndex]['成员'] 
+                ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+                : [];
+                
+            currentMembers.push(member);
+            tableData.rows[rowIndex]['成员'] = currentMembers.join(',');
+            renderTable();
+            saveToLocalStorage();
+            
+            // 广播移动到组事件
+            broadcastData({
+                type: 'moveToGroup',
+                member: member,
+                groupId: groupId
+            });
+        }
+    }
 }
 
 // 开始编辑单元格
@@ -184,148 +534,22 @@ function finishEditing(cell, rowId, column, newValue, originalContent) {
     
     cell.classList.remove('editing');
     
-    const rowData = {};
-    rowData[column] = newValue;
+    updateRowInTable(rowId, column, newValue);
     
-    updateRowInTable(rowId, rowData);
-}
-
-// 向分组添加成员
-function addMemberToGroup(rowId) {
-    const row = tableData.rows.find(r => r.id === rowId);
-    if (!row) return;
-    
-    // 如果有未分组成员，显示选择对话框
-    if (ungroupedMembers.length > 0) {
-        const memberName = prompt('输入成员姓名或从未分组成员中选择（' + ungroupedMembers.join('、') + '）:');
-        if (!memberName || !memberName.trim()) return;
-        
-        // 如果该成员在未分组列表中，将其移除
-        const memberIndex = ungroupedMembers.indexOf(memberName.trim());
-        if (memberIndex >= 0) {
-            ungroupedMembers.splice(memberIndex, 1);
-            renderUngroupedMembers();
-        }
-        
-        addMemberToGroupImpl(rowId, memberName.trim());
-    } else {
-        const memberName = prompt('请输入成员姓名:');
-        if (!memberName || !memberName.trim()) return;
-        
-        addMemberToGroupImpl(rowId, memberName.trim());
-    }
-}
-
-// 实际添加成员到分组的通用函数
-function addMemberToGroupImpl(rowId, memberName) {
-    const row = tableData.rows.find(r => r.id === rowId);
-    if (!row) return;
-    
-    // 获取当前成员列表
-    let currentMembers = row['成员'] ? row['成员'].split(',').filter(m => m.trim()) : [];
-    
-    // 检查是否已存在
-    if (currentMembers.includes(memberName)) {
-        alert('该成员已存在于分组中');
-        return;
-    }
-    
-    // 添加新成员
-    currentMembers.push(memberName);
-    
-    // 更新行数据
-    const updatedMembers = currentMembers.join(',');
-    updateRowInTable(rowId, { '成员': updatedMembers });
-    
-    saveToLocalStorage();
-}
-
-// 从分组中移除成员
-function removeMemberFromGroup(rowId, memberName) {
-    if (!confirm(`确定要从当前分组移除成员"${memberName}"吗？`)) return;
-    
-    const row = tableData.rows.find(r => r.id === rowId);
-    if (!row) return;
-    
-    // 获取当前成员列表
-    let currentMembers = row['成员'] ? row['成员'].split(',').filter(m => m.trim()) : [];
-    
-    // 移除成员
-    const updatedMembers = currentMembers.filter(m => m !== memberName);
-    
-    // 更新行数据
-    const updatedMembersStr = updatedMembers.join(',');
-    updateRowInTable(rowId, { '成员': updatedMembersStr });
-    
-    saveToLocalStorage();
-}
-
-// 添加未分组成员
-function addUngroupedMember(name) {
-    if (!name || !name.trim()) return;
-    
-    // 检查是否已存在
-    if (ungroupedMembers.includes(name.trim())) {
-        alert('该成员已存在于未分组列表中');
-        return;
-    }
-    
-    // 检查是否已在某个分组中
-    let memberExists = false;
-    tableData.rows.forEach(row => {
-        const members = row['成员'] ? row['成员'].split(',').filter(m => m.trim()) : [];
-        if (members.includes(name.trim())) {
-            memberExists = true;
-            return;
-        }
+    // 广播编辑组名事件
+    broadcastData({
+        type: 'editGroupName',
+        groupId: rowId,
+        newName: newValue
     });
-    
-    if (memberExists) {
-        alert('该成员已存在于某个分组中');
-        return;
-    }
-    
-    // 添加到未分组列表
-    ungroupedMembers.push(name.trim());
-    renderUngroupedMembers();
-    saveToLocalStorage();
-}
-
-// 移除未分组成员
-function removeUngroupedMember(name) {
-    if (!confirm(`确定要移除未分组成员"${name}"吗？`)) return;
-    
-    const index = ungroupedMembers.indexOf(name);
-    if (index >= 0) {
-        ungroupedMembers.splice(index, 1);
-        renderUngroupedMembers();
-        saveToLocalStorage();
-    }
-}
-
-// 添加行到表格
-function addRowToTable() {
-    const newRow = {
-        id: uuid.v4(),
-        '组名': '组 ' + (tableData.rows.length + 1),
-        '成员': ''
-    };
-    
-    tableData.rows.push(newRow);
-    renderTable();
-    saveToLocalStorage();
 }
 
 // 更新行数据
-function updateRowInTable(rowId, rowData) {
+function updateRowInTable(rowId, column, newValue) {
     const rowIndex = tableData.rows.findIndex(row => row.id === rowId);
     
     if (rowIndex >= 0) {
-        tableData.rows[rowIndex] = {
-            ...tableData.rows[rowIndex],
-            ...rowData
-        };
-        
+        tableData.rows[rowIndex][column] = newValue;
         renderTable();
         saveToLocalStorage();
     }
@@ -342,15 +566,197 @@ function deleteRowFromTable(rowId) {
         const row = tableData.rows[rowIndex];
         const members = row['成员'] ? row['成员'].split(',').filter(m => m.trim()) : [];
         
-        if (members.length > 0 && confirm('是否将该分组的成员移至未分组列表？')) {
-            ungroupedMembers.push(...members);
-            renderUngroupedMembers();
+        let keepMembers = false;
+        if (members.length > 0) {
+            keepMembers = confirm('是否将该分组的成员移至未分组列表？');
+            
+            if (keepMembers) {
+                ungroupedMembers.push(...members);
+                renderUngroupedMembers();
+            }
         }
         
+        // 记录组ID，用于广播
+        const groupId = row.id;
+        
+        // 删除组
         tableData.rows.splice(rowIndex, 1);
         renderTable();
         saveToLocalStorage();
+        
+        // 广播删除组事件
+        broadcastData({
+            type: 'deleteGroup',
+            groupId: groupId,
+            keepMembers: keepMembers
+        });
     }
+}
+
+// 向分组添加成员
+function addMemberToGroup(rowId) {
+    const rowIndex = tableData.rows.findIndex(row => row.id === rowId);
+    if (rowIndex === -1) return;
+    
+    // 如果有未分组成员，显示选择对话框
+    if (ungroupedMembers.length > 0) {
+        const memberName = prompt('输入成员姓名或从未分组成员中选择（' + ungroupedMembers.join('、') + '）:');
+        if (!memberName || !memberName.trim()) return;
+        
+        // 如果该成员在未分组列表中，将其移除
+        const memberIndex = ungroupedMembers.indexOf(memberName.trim());
+        if (memberIndex >= 0) {
+            ungroupedMembers.splice(memberIndex, 1);
+            renderUngroupedMembers();
+            
+            // 广播移除未分组成员事件
+            broadcastData({
+                type: 'removeUngrouped',
+                member: memberName.trim()
+            });
+        }
+        
+        addMemberToGroupImpl(rowId, memberName.trim());
+    } else {
+        const memberName = prompt('请输入成员姓名:');
+        if (!memberName || !memberName.trim()) return;
+        
+        addMemberToGroupImpl(rowId, memberName.trim());
+    }
+}
+
+// 实际添加成员到分组的通用函数
+function addMemberToGroupImpl(rowId, memberName) {
+    const rowIndex = tableData.rows.findIndex(row => row.id === rowId);
+    if (rowIndex === -1) return;
+    
+    // 获取当前成员列表
+    let currentMembers = tableData.rows[rowIndex]['成员'] 
+        ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+        : [];
+    
+    // 检查是否已存在
+    if (currentMembers.includes(memberName)) {
+        alert('该成员已存在于分组中');
+        return;
+    }
+    
+    // 添加新成员
+    currentMembers.push(memberName);
+    tableData.rows[rowIndex]['成员'] = currentMembers.join(',');
+    
+    renderTable();
+    saveToLocalStorage();
+    
+    // 广播添加成员事件
+    broadcastData({
+        type: 'addMember',
+        groupId: rowId,
+        member: memberName
+    });
+}
+
+// 从分组中移除成员
+function removeMemberFromGroup(rowId, memberName) {
+    if (!confirm(`确定要从当前分组移除成员"${memberName}"吗？`)) return;
+    
+    const rowIndex = tableData.rows.findIndex(row => row.id === rowId);
+    if (rowIndex === -1) return;
+    
+    // 获取当前成员列表
+    let currentMembers = tableData.rows[rowIndex]['成员'] 
+        ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+        : [];
+    
+    // 移除成员
+    const updatedMembers = currentMembers.filter(m => m !== memberName);
+    tableData.rows[rowIndex]['成员'] = updatedMembers.join(',');
+    
+    renderTable();
+    saveToLocalStorage();
+    
+    // 询问是否将成员移动到未分组列表
+    if (confirm(`是否将 ${memberName} 移动到未分组列表？`)) {
+        ungroupedMembers.push(memberName);
+        renderUngroupedMembers();
+        
+        // 广播移除成员和添加到未分组事件
+        broadcastData({
+            type: 'removeMember',
+            groupId: rowId,
+            member: memberName
+        });
+        
+        broadcastData({
+            type: 'addUngrouped',
+            member: memberName
+        });
+    } else {
+        // 只广播移除成员事件
+        broadcastData({
+            type: 'removeMember',
+            groupId: rowId,
+            member: memberName
+        });
+    }
+}
+
+// 添加未分组成员
+function addUngroupedMember() {
+    const memberName = newMemberInput.value.trim();
+    if (!memberName) {
+        alert('请输入成员姓名');
+        return;
+    }
+    
+    // 检查是否已存在
+    if (ungroupedMembers.includes(memberName)) {
+        alert('该成员已存在于未分组列表中');
+        return;
+    }
+    
+    // 检查是否已在某个分组中
+    let memberExists = false;
+    tableData.rows.forEach(row => {
+        const members = row['成员'] ? row['成员'].split(',').filter(m => m.trim()) : [];
+        if (members.includes(memberName)) {
+            memberExists = true;
+            return;
+        }
+    });
+    
+    if (memberExists) {
+        alert('该成员已存在于某个分组中');
+        return;
+    }
+    
+    // 添加到未分组列表
+    ungroupedMembers.push(memberName);
+    renderUngroupedMembers();
+    saveToLocalStorage();
+    newMemberInput.value = '';
+    
+    // 广播添加未分组成员事件
+    broadcastData({
+        type: 'addUngrouped',
+        member: memberName
+    });
+}
+
+// 从未分组列表移除成员
+function removeUngroupedMember(member) {
+    const index = ungroupedMembers.indexOf(member);
+    if (index === -1) return;
+    
+    ungroupedMembers.splice(index, 1);
+    renderUngroupedMembers();
+    saveToLocalStorage();
+    
+    // 广播移除未分组成员事件
+    broadcastData({
+        type: 'removeUngrouped',
+        member: member
+    });
 }
 
 // 导出分组信息
@@ -483,54 +889,205 @@ function loadFromLocalStorage() {
     }
 }
 
-// 设置事件监听器
-function setupEventListeners() {
-    // 添加分组按钮
-    addGroupBtn.addEventListener('click', () => {
-        addRowToTable();
-    });
+// 加载已保存的数据并更新UI
+function loadStoredData() {
+    if (confirm('确定要加载保存的数据吗？这将覆盖当前分组数据。')) {
+        loadData();
+        renderTable();
+        renderUngroupedMembers();
+        
+        // 广播更新给连接的用户
+        broadcastData({
+            type: 'sync',
+            tableData: tableData,
+            ungroupedMembers: ungroupedMembers
+        });
+        
+        alert('数据已加载');
+    }
+}
+
+// 处理接收到的数据
+function handleDataReceived(data, wire) {
+    console.log('收到数据:', data);
     
-    // 保存本地按钮
-    saveLocalBtn.addEventListener('click', () => {
+    // 忽略自己发送的消息
+    if (data.from === myPeerId) {
+        return;
+    }
+    
+    if (data.type === 'sync') {
+        // 完整数据同步
+        tableData = data.tableData;
+        ungroupedMembers = data.ungroupedMembers;
+        renderTable();
+        renderUngroupedMembers();
+        
+        // 保存到本地存储
         saveToLocalStorage();
-    });
-    
-    // 加载本地按钮
-    loadLocalBtn.addEventListener('click', () => {
-        if (confirm('确定要加载保存的数据吗？这将覆盖当前分组数据。')) {
-            loadFromLocalStorage();
+    } else if (data.type === 'addGroup') {
+        // 添加新组
+        tableData.rows.push(data.group);
+        renderTable();
+        saveToLocalStorage();
+    } else if (data.type === 'editGroupName') {
+        // 编辑组名
+        const rowIndex = tableData.rows.findIndex(row => row.id === data.groupId);
+        if (rowIndex !== -1) {
+            tableData.rows[rowIndex]['组名'] = data.newName;
             renderTable();
-            renderUngroupedMembers();
+            saveToLocalStorage();
         }
-    });
-    
-    // 导出数据按钮
-    exportDataBtn.addEventListener('click', () => {
-        exportGroupData();
-    });
-    
-    // 添加未分组成员按钮
-    addUngroupedBtn.addEventListener('click', () => {
-        const name = newMemberInput.value.trim();
-        if (name) {
-            addUngroupedMember(name);
-            newMemberInput.value = '';
-        } else {
-            alert('请输入成员姓名');
+    } else if (data.type === 'deleteGroup') {
+        // 删除组
+        const rowIndex = tableData.rows.findIndex(row => row.id === data.groupId);
+        if (rowIndex !== -1) {
+            // 如果需要保留成员，则添加到未分组列表
+            if (data.keepMembers) {
+                const members = tableData.rows[rowIndex]['成员'] 
+                    ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+                    : [];
+                ungroupedMembers.push(...members);
+                renderUngroupedMembers();
+            }
+            
+            tableData.rows.splice(rowIndex, 1);
+            renderTable();
+            saveToLocalStorage();
         }
-    });
-    
-    // 未分组成员输入框回车事件
-    newMemberInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            const name = newMemberInput.value.trim();
-            if (name) {
-                addUngroupedMember(name);
-                newMemberInput.value = '';
-            } else {
-                alert('请输入成员姓名');
+    } else if (data.type === 'addMember') {
+        // 添加成员到组
+        const rowIndex = tableData.rows.findIndex(row => row.id === data.groupId);
+        if (rowIndex !== -1) {
+            const currentMembers = tableData.rows[rowIndex]['成员'] 
+                ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+                : [];
+            
+            if (!currentMembers.includes(data.member)) {
+                currentMembers.push(data.member);
+                tableData.rows[rowIndex]['成员'] = currentMembers.join(',');
+                renderTable();
+                saveToLocalStorage();
             }
         }
+    } else if (data.type === 'removeMember') {
+        // 从组中移除成员
+        const rowIndex = tableData.rows.findIndex(row => row.id === data.groupId);
+        if (rowIndex !== -1) {
+            const currentMembers = tableData.rows[rowIndex]['成员'] 
+                ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+                : [];
+            
+            const updatedMembers = currentMembers.filter(m => m !== data.member);
+            tableData.rows[rowIndex]['成员'] = updatedMembers.join(',');
+            renderTable();
+            saveToLocalStorage();
+        }
+    } else if (data.type === 'addUngrouped') {
+        // 添加未分组成员
+        if (!ungroupedMembers.includes(data.member)) {
+            ungroupedMembers.push(data.member);
+            renderUngroupedMembers();
+            saveToLocalStorage();
+        }
+    } else if (data.type === 'removeUngrouped') {
+        // 删除未分组成员
+        const index = ungroupedMembers.indexOf(data.member);
+        if (index !== -1) {
+            ungroupedMembers.splice(index, 1);
+            renderUngroupedMembers();
+            saveToLocalStorage();
+        }
+    } else if (data.type === 'moveToGroup') {
+        // 将未分组成员移动到组
+        const index = ungroupedMembers.indexOf(data.member);
+        if (index !== -1) {
+            ungroupedMembers.splice(index, 1);
+            
+            const rowIndex = tableData.rows.findIndex(row => row.id === data.groupId);
+            if (rowIndex !== -1) {
+                const currentMembers = tableData.rows[rowIndex]['成员'] 
+                    ? tableData.rows[rowIndex]['成员'].split(',').filter(m => m.trim()) 
+                    : [];
+                
+                currentMembers.push(data.member);
+                tableData.rows[rowIndex]['成员'] = currentMembers.join(',');
+            }
+            
+            renderTable();
+            renderUngroupedMembers();
+            saveToLocalStorage();
+        }
+    }
+}
+
+// 加载数据
+function loadData() {
+    const savedData = localStorage.getItem('groupTableData');
+    const savedUngrouped = localStorage.getItem('ungroupedMembers');
+    
+    if (savedData) {
+        try {
+            tableData = JSON.parse(savedData);
+        } catch (e) {
+            console.error('加载分组数据失败:', e);
+            tableData = { columns: ['组名', '成员'], rows: [] };
+        }
+    } else {
+        tableData = { columns: ['组名', '成员'], rows: [] };
+    }
+    
+    if (savedUngrouped) {
+        try {
+            ungroupedMembers = JSON.parse(savedUngrouped);
+        } catch (e) {
+            console.error('加载未分组成员失败:', e);
+            ungroupedMembers = [];
+        }
+    } else {
+        ungroupedMembers = [];
+    }
+}
+
+// 保存数据
+function saveData() {
+    saveToLocalStorage();
+    
+    // 显示保存成功消息
+    const saveBtn = document.getElementById('save-local');
+    const originalText = saveBtn.textContent;
+    saveBtn.textContent = '✓ 已保存';
+    saveBtn.style.backgroundColor = '#27ae60';
+    
+    // 广播当前数据
+    broadcastData({
+        type: 'sync',
+        tableData: tableData,
+        ungroupedMembers: ungroupedMembers
+    });
+    
+    setTimeout(() => {
+        saveBtn.textContent = originalText;
+        saveBtn.style.backgroundColor = '';
+    }, 2000);
+}
+
+// 添加新组
+function addNewGroup() {
+    const newRow = {
+        id: uuid.v4(),
+        '组名': '组 ' + (tableData.rows.length + 1),
+        '成员': ''
+    };
+    
+    tableData.rows.push(newRow);
+    renderTable();
+    saveToLocalStorage();
+    
+    // 广播添加组事件
+    broadcastData({
+        type: 'addGroup',
+        group: newRow
     });
 }
 

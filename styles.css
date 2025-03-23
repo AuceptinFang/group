@@ -29,7 +29,7 @@ header {
 h1 {
     color: #2c3e50;
     font-size: 2.2rem;
-    margin-bottom: 10px;
+    margin-bottom: 20px;
     text-align: center;
 }
 
@@ -39,6 +39,97 @@ h2 {
     margin-bottom: 15px;
     padding-bottom: 10px;
     border-bottom: 2px solid #f0f4f8;
+}
+
+h3 {
+    color: #2c3e50;
+    font-size: 1.2rem;
+    margin-bottom: 10px;
+}
+
+/* P2P连接样式 */
+.connection-info {
+    background-color: #f8f9fa;
+    padding: 15px;
+    border-radius: 8px;
+    margin-top: 15px;
+    text-align: left;
+}
+
+#connection-status {
+    display: inline-block;
+    font-weight: bold;
+    padding: 6px 12px;
+    border-radius: 4px;
+    margin-bottom: 10px;
+    background-color: #f8d7da;
+    color: #721c24;
+    transition: all 0.3s ease;
+}
+
+#connection-status.connected {
+    background-color: #d4edda;
+    color: #155724;
+}
+
+#room-info {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    align-items: center;
+}
+
+#room-id {
+    flex: 1;
+    padding: 10px;
+    border: 1px solid #ced4da;
+    border-radius: 6px;
+}
+
+#join-room {
+    background-color: #3498db;
+    color: white;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
+
+#join-room:hover {
+    background-color: #2980b9;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+#connected-peers {
+    margin-top: 15px;
+}
+
+.peer-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    background-color: white;
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid #dee2e6;
+    min-height: 40px;
+}
+
+.peer-list:empty::before {
+    content: '正在搜索其他用户...';
+    color: #adb5bd;
+    font-style: italic;
+}
+
+.peer-tag {
+    background-color: #e1f5fe;
+    color: #0288d1;
+    padding: 4px 10px;
+    border-radius: 16px;
+    font-size: 0.9rem;
+    display: inline-block;
 }
 
 input[type="text"] {
@@ -389,7 +480,7 @@ footer {
         padding: 20px;
     }
     
-    .table-controls, .left-controls, .right-controls {
+    .table-controls, .left-controls, .right-controls, .peer-controls {
         flex-direction: column;
         width: 100%;
     }
